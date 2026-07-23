@@ -17,8 +17,8 @@ import {
 } from "@earendil-works/pi-coding-agent"
 
 /**
- * One child pi process per task. Persistent sessions reuse Pi's JSONL session
- * file; worktrees are independent and only enabled by agent frontmatter.
+ * Persistent sessions are opt-in per agent. Code-agent worktrees are temporary:
+ * changed worktrees are committed to a branch and then removed.
  */
 
 type Agent = {
@@ -29,6 +29,7 @@ type Agent = {
   tools?: string[]
   toolsBlacklist?: string[]
   skills?: string[]
+  persistent: boolean
   worktree: boolean
   prompt: string
   source: "user" | "project"
@@ -94,7 +95,7 @@ const TaskSchema = Type.Object({
   tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
   toolsBlacklist: Type.Optional(Type.String({ description: "Comma-separated tool denylist" })),
   skills: Type.Optional(Type.String({ description: "Comma-separated skill allowlist" })),
-  session: Type.Optional(Type.String({ description: "Persistent session name" })),
+  session: Type.Optional(Type.String({ description: "Persistent session name (only for agents configured as persistent)" })),
   initialContext: Type.Optional(Type.String({ description: '"empty" (default) or "parent"' })),
 })
 
@@ -105,7 +106,7 @@ const SubagentParams = Type.Object({
   tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
   toolsBlacklist: Type.Optional(Type.String({ description: "Comma-separated tool denylist" })),
   skills: Type.Optional(Type.String({ description: "Comma-separated skill allowlist" })),
-  session: Type.Optional(Type.String({ description: "Persistent session name" })),
+  session: Type.Optional(Type.String({ description: "Persistent session name (only for agents configured as persistent)" })),
   initialContext: Type.Optional(Type.String({ description: '"empty" (default) or "parent"' })),
   background: Type.Optional(Type.Boolean({ description: "Run without blocking; completion is sent back to parent session" })),
   tasks: Type.Optional(Type.Array(TaskSchema, { description: "Tasks to run in parallel" })),
@@ -140,6 +141,7 @@ function parseAgent(filePath: string, source: Agent["source"]): Agent | undefine
     tools,
     toolsBlacklist,
     skills: splitList(frontmatter.skills),
+    persistent: frontmatter.persistent === true || frontmatter.persistent === "true",
     worktree: frontmatter.worktree === true || frontmatter.worktree === "true",
     prompt: body.trim(),
     source,
@@ -194,21 +196,6 @@ function formatAge(date: Date): string {
 function oneLine(value: string, max = 90): string {
   const text = value.replace(/\s+/g, " ").trim()
   return text.length > max ? `${text.slice(0, max - 1)}…` : text || "(no task recorded)"
-}
-
-function worktreeDetails(cwd: string, sessionId: string): { path: string; branch: string; changes: string } | undefined {
-  const root = gitRoot(cwd)
-  if (!root) return undefined
-  const worktree = path.join(root, CONFIG_DIR_NAME, "worktrees", `subagent-${sessionId}`)
-  if (!fs.existsSync(worktree)) return undefined
-  let changes = "unknown"
-  try {
-    const output = git(worktree, ["status", "--short"])
-    changes = output ? `${output.split("\n").length} changed file(s)` : "clean"
-  } catch {
-    // The worktree is useful even if git status is currently unavailable.
-  }
-  return { path: worktree, branch: `pi-subagent/${sessionId}`, changes }
 }
 
 async function listPersistentSessions(ctx: ExtensionContext): Promise<SessionPanelItem[]> {
@@ -322,15 +309,47 @@ function gitRoot(cwd: string): string | undefined {
 function createWorktree(cwd: string, id: string): { worktree: string; branch: string } {
   const root = gitRoot(cwd)
   if (!root) throw new Error("Agent requires a git worktree, but cwd is not a git repository")
-  const worktree = path.join(root, CONFIG_DIR_NAME, "worktrees", `subagent-${id}`)
-  const branch = `pi-subagent/${id}`
-  fs.mkdirSync(path.dirname(worktree), { recursive: true })
+  const branch = `pi-agent-${id}`
+  const worktree = path.join(os.tmpdir(), `pi-agent-${id}-${randomUUID().slice(0, 8)}`)
   try {
-    git(root, ["worktree", "add", "-b", branch, worktree, "HEAD"])
+    git(root, ["worktree", "add", "--detach", worktree, "HEAD"])
   } catch (error) {
     throw new Error(`Failed to create worktree: ${error instanceof Error ? error.message : String(error)}`)
   }
   return { worktree, branch }
+}
+
+function removeWorktree(root: string, worktree: string): void {
+  try {
+    git(root, ["worktree", "remove", "--force", worktree])
+  } catch {
+    try {
+      git(root, ["worktree", "prune"])
+    } catch {
+      // Best-effort recovery only; preserve the child result.
+    }
+  }
+}
+
+function cleanupWorktree(root: string, worktree: string, branch: string, description: string): string | undefined {
+  if (!fs.existsSync(worktree)) return undefined
+  try {
+    if (!git(worktree, ["status", "--porcelain"])) return undefined
+    git(worktree, ["add", "-A"])
+    git(worktree, ["commit", "-m", `pi-agent: ${description.slice(0, 200)}`])
+    let savedBranch = branch
+    try {
+      git(worktree, ["branch", savedBranch])
+    } catch {
+      savedBranch = `${branch}-${Date.now()}`
+      git(worktree, ["branch", savedBranch])
+    }
+    return savedBranch
+  } catch {
+    return undefined
+  } finally {
+    removeWorktree(root, worktree)
+  }
 }
 
 function outputText(message: unknown): string | undefined {
@@ -519,6 +538,7 @@ export default function (pi: ExtensionAPI) {
     let branch: string | undefined
 
     if (task.session !== undefined) {
+      if (!agent.persistent) throw new Error(`Agent ${agent.name} does not support persistent sessions`)
       const handle = task.session.trim()
       if (!handle) throw new Error("session cannot be empty")
       const id = namedSessionId(ctx.cwd, agent.name, handle)
@@ -533,22 +553,6 @@ export default function (pi: ExtensionAPI) {
           name: namedSessionLabel(agent.name, handle),
           created: !existing.some((candidate) => candidate.id === id),
         }
-        if (agent.worktree) {
-          const root = gitRoot(ctx.cwd)
-          if (!root) throw new Error("Agent requires a git worktree, but cwd is not a git repository")
-          const persistentWorktree = path.join(root, CONFIG_DIR_NAME, "worktrees", `subagent-${id}`)
-          if (!fs.existsSync(persistentWorktree)) {
-            if (!namedSession.created) throw new Error(`Persistent worktree is missing: ${persistentWorktree}`)
-            const created = createWorktree(ctx.cwd, id)
-            cwd = created.worktree
-            worktree = created.worktree
-            branch = created.branch
-          } else {
-            cwd = persistentWorktree
-            worktree = persistentWorktree
-            branch = `pi-subagent/${id}`
-          }
-        }
       } catch (error) {
         runningPersistentSessions.delete(id)
         throw error
@@ -561,6 +565,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const prompt = temporaryPrompt(agent, namedSession?.created ? initialContext : task.session ? "empty" : initialContext, ctx)
+    let child: Omit<RunResult, "agent" | "worktree" | "branch"> | undefined
+    let savedBranch: string | undefined
     try {
       const args = ["--mode", "json", "-p", ...resolveCliOptions(agent, task, ctx)]
       if (task.model ?? agent.model) args.push("--model", task.model ?? agent.model!)
@@ -573,12 +579,20 @@ export default function (pi: ExtensionAPI) {
       }
       if (prompt.file) args.push("--append-system-prompt", prompt.file)
       args.push(`Task: ${task.task}`)
-      const result = await runChild(args, cwd, signal, onUpdate)
-      return { agent: agent.name, ...result, worktree, branch }
+      child = await runChild(args, cwd, signal, onUpdate)
     } finally {
       prompt.remove()
+      if (worktree && branch) {
+        const root = gitRoot(ctx.cwd)
+        if (root) savedBranch = cleanupWorktree(root, worktree, branch, task.task)
+      }
       if (persistentLock) runningPersistentSessions.delete(persistentLock)
     }
+    if (!child) throw new Error("Subagent exited without a result")
+    const output = savedBranch
+      ? `${child.output}\n\n---\nChanges saved to branch \`${savedBranch}\`. Merge with: \`git merge ${savedBranch}\``
+      : child.output
+    return { agent: agent.name, ...child, output, branch: savedBranch }
   }
 
   const runWorkflow = async (params: Record<string, unknown>, ctx: ExtensionContext, signal?: AbortSignal, onUpdate?: (output: string) => void): Promise<WorkflowResult> => {
@@ -627,7 +641,7 @@ export default function (pi: ExtensionAPI) {
       sessionError = error instanceof Error ? error.message : String(error)
     }
     const agentLines = agents.length > 0
-      ? agents.map((agent) => `- ${agent.name}: ${agent.description}${agent.worktree ? " (isolated worktree)" : ""}`).join("\n")
+      ? agents.map((agent) => `- ${agent.name}: ${agent.description}${agent.persistent ? " (persistent sessions)" : ""}${agent.worktree ? " (temporary isolated worktree)" : ""}`).join("\n")
       : "- (none discovered)"
     const sessionLines = sessionError
       ? `- unavailable: ${sessionError}`
@@ -746,8 +760,6 @@ export default function (pi: ExtensionAPI) {
         `Last active: ${item.session.modified.toISOString()} (${formatAge(item.session.modified)})`,
         `Session ID: ${item.session.id}`,
         `First task: ${oneLine(item.session.firstMessage)}`,
-        `Worktree: ${worktree ? worktree.path : "shared cwd"}`,
-        ...(worktree ? [`Branch: ${worktree.branch}`, `Changes: ${worktree.changes}`] : []),
       ]
       await ctx.ui.select("Subagent details", details)
     },
