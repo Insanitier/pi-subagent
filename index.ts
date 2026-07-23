@@ -3,6 +3,7 @@ import * as path from "path"
 import * as os from "os"
 import * as crypto from "crypto"
 import { spawn } from "child_process"
+import { Type } from "@sinclair/typebox"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 
 interface Agent {
@@ -184,6 +185,23 @@ async function runSingleAgent(
   })
 }
 
+const TaskItem = Type.Object({
+  agent: Type.String({ description: "Name of the agent to invoke" }),
+  task: Type.String({ description: "Task to delegate to the agent" }),
+});
+
+const ChainItem = Type.Object({
+  agent: Type.String({ description: "Name of the agent to invoke" }),
+  task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+});
+
+const SubagentParams = Type.Object({
+  agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
+  task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+  tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
+  chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+});
+
 export default function (pi: ExtensionAPI) {
   const agents = discoverAgents()
 
@@ -191,37 +209,7 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description: "Delegate tasks to specialized subagents with isolated context. Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-    parameters: {
-      type: "object",
-      properties: {
-        agent: { type: "string", description: "Agent name for single mode" },
-        task: { type: "string", description: "Task for single mode" },
-        tasks: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              agent: { type: "string" },
-              task: { type: "string" }
-            },
-            required: ["agent", "task"]
-          },
-          description: "Array of {agent, task} for parallel execution"
-        },
-        chain: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              agent: { type: "string" },
-              task: { type: "string" }
-            },
-            required: ["agent", "task"]
-          },
-          description: "Array of {agent, task} for sequential execution with {previous} placeholder"
-        }
-      }
-    },
+    parameters: SubagentParams,
 
     async execute(_toolCallId: string, params: any) {
       const hasChain = (params.chain?.length ?? 0) > 0
