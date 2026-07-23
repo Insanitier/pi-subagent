@@ -11,6 +11,7 @@ import {
   truncateHead,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
+  SessionManager,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent"
@@ -44,17 +45,21 @@ type Task = {
   initialContext?: string
 }
 
-type PersistentAgent = {
-  key: string
-  agent: string
-  session: string
-  sessionFile: string
+type NativeSession = {
+  id: string
+  name?: string
   cwd: string
-  workspace: "shared" | "worktree"
-  worktree?: string
-  branch?: string
-  createdAt: string
-  lastUsedAt: string
+  created: Date
+  modified: Date
+  messageCount: number
+  firstMessage: string
+}
+
+type SessionPanelItem = {
+  session: NativeSession
+  agent: string
+  handle: string
+  active: boolean
 }
 
 type Run = {
@@ -80,8 +85,6 @@ type WorkflowResult = {
   results: RunResult[]
 }
 
-const stateFile = path.join(getAgentDir(), "subagent-sessions.json")
-const persistentDir = path.join(getAgentDir(), "subagent-sessions")
 const runningPersistentSessions = new Set<string>()
 
 const TaskSchema = Type.Object({
@@ -171,34 +174,54 @@ function discoverAgents(ctx: ExtensionContext): Agent[] {
   return [...agents.values()]
 }
 
-function readState(): PersistentAgent[] {
-  if (!fs.existsSync(stateFile)) return []
-  let value: unknown
+function namedSessionId(cwd: string, agent: string, handle: string): string {
+  return `subagent.${createHash("sha256").update(JSON.stringify([path.resolve(cwd), agent, handle])).digest("hex").slice(0, 16)}`
+}
+
+function namedSessionParts(name: string): { agent: string; handle: string } | undefined {
+  const match = /^subagent: ([^·]+) · (.+)$/.exec(name)
+  return match ? { agent: match[1].trim(), handle: match[2].trim() } : undefined
+}
+
+function formatAge(date: Date): string {
+  const elapsed = Math.max(0, Date.now() - date.getTime())
+  if (elapsed < 60_000) return "now"
+  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}m ago`
+  if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}h ago`
+  return `${Math.floor(elapsed / 86_400_000)}d ago`
+}
+
+function oneLine(value: string, max = 90): string {
+  const text = value.replace(/\s+/g, " ").trim()
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text || "(no task recorded)"
+}
+
+function worktreeDetails(cwd: string, sessionId: string): { path: string; branch: string; changes: string } | undefined {
+  const root = gitRoot(cwd)
+  if (!root) return undefined
+  const worktree = path.join(root, CONFIG_DIR_NAME, "worktrees", `subagent-${sessionId}`)
+  if (!fs.existsSync(worktree)) return undefined
+  let changes = "unknown"
   try {
-    value = JSON.parse(fs.readFileSync(stateFile, "utf8"))
-  } catch (error) {
-    throw new Error(`Cannot read ${stateFile}: ${error instanceof Error ? error.message : String(error)}`)
+    const output = git(worktree, ["status", "--short"])
+    changes = output ? `${output.split("\n").length} changed file(s)` : "clean"
+  } catch {
+    // The worktree is useful even if git status is currently unavailable.
   }
-  if (!Array.isArray(value) || !value.every((entry) => entry && typeof entry === "object")) {
-    throw new Error(`Cannot read ${stateFile}: expected an array`)
-  }
-  return value as PersistentAgent[]
+  return { path: worktree, branch: `pi-subagent/${sessionId}`, changes }
 }
 
-function writeState(records: PersistentAgent[]): void {
-  fs.mkdirSync(path.dirname(stateFile), { recursive: true })
-  const temporary = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
-  fs.writeFileSync(temporary, `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600 })
-  fs.renameSync(temporary, stateFile)
+async function listPersistentSessions(ctx: ExtensionContext): Promise<SessionPanelItem[]> {
+  const sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager.getSessionDir()) as NativeSession[]
+  return sessions.flatMap((session) => {
+    if (!session.name) return []
+    const parts = namedSessionParts(session.name)
+    return parts ? [{ session, ...parts, active: false }] : []
+  })
 }
 
-function persistentKey(cwd: string, agent: string, session: string): string {
-  return JSON.stringify([path.resolve(cwd), agent, session])
-}
-
-function sessionPathFor(key: string): string {
-  const digest = createHash("sha256").update(key).digest("hex").slice(0, 24)
-  return path.join(persistentDir, `${digest}.jsonl`)
+function namedSessionLabel(agent: string, handle: string): string {
+  return `subagent: ${agent} · ${handle.replace(/\s+/g, " ").trim()}`
 }
 
 function parseInitialContext(value: string | undefined): "empty" | "parent" {
@@ -430,17 +453,9 @@ function assertValidRequest(params: Record<string, unknown>): void {
 }
 
 function assertSubagentSelfCheck(): void {
-  const record: PersistentAgent = {
-    key: persistentKey("/tmp/project", "research", "paper-a"),
-    agent: "research",
-    session: "paper-a",
-    sessionFile: "/tmp/research.jsonl",
-    cwd: "/tmp/project",
-    workspace: "shared",
-    createdAt: "now",
-    lastUsedAt: "now",
+  if (namedSessionId("/tmp/project", "research", "paper-a") === namedSessionId("/tmp/project", "research", "paper-b")) {
+    throw new Error("Named session IDs must be distinct")
   }
-  if (record.key === persistentKey("/tmp/project", "research", "paper-b")) throw new Error("Persistent session keys must be distinct")
   try {
     assertValidRequest({ agent: "research" })
     throw new Error("Invalid request was accepted")
@@ -497,56 +512,45 @@ export default function (pi: ExtensionAPI) {
     if (!task.task?.trim()) throw new Error(`Task for ${agent.name} cannot be empty`)
 
     const initialContext = parseInitialContext(task.initialContext)
-    let record: PersistentAgent | undefined
-    let records: PersistentAgent[] | undefined
-    let isNewPersistentSession = false
+    let namedSession: NamedSession | undefined
     let persistentLock: string | undefined
     let cwd = ctx.cwd
     let worktree: string | undefined
     let branch: string | undefined
 
     if (task.session !== undefined) {
-      if (!task.session.trim()) throw new Error("session cannot be empty")
-      const key = persistentKey(ctx.cwd, agent.name, task.session)
-      if (runningPersistentSessions.has(key)) throw new Error(`Persistent session already running: ${agent.name}/${task.session}`)
-      runningPersistentSessions.add(key)
-      persistentLock = key
+      const handle = task.session.trim()
+      if (!handle) throw new Error("session cannot be empty")
+      const id = namedSessionId(ctx.cwd, agent.name, handle)
+      if (runningPersistentSessions.has(id)) throw new Error(`Persistent session already running: ${agent.name}/${handle}`)
+      runningPersistentSessions.add(id)
+      persistentLock = id
       try {
-        records = readState()
-        record = records.find((candidate) => candidate.key === key)
-        if (!record) {
-          fs.mkdirSync(persistentDir, { recursive: true })
-          record = {
-            key,
-            agent: agent.name,
-            session: task.session,
-            sessionFile: sessionPathFor(key),
-            cwd: ctx.cwd,
-            workspace: agent.worktree ? "worktree" : "shared",
-            createdAt: new Date().toISOString(),
-            lastUsedAt: new Date().toISOString(),
-          }
-          if (record.workspace === "worktree") {
-            const created = createWorktree(ctx.cwd, createHash("sha256").update(key).digest("hex").slice(0, 16))
-            record.worktree = created.worktree
-            record.branch = created.branch
-          }
-          isNewPersistentSession = true
-          records.push(record)
-        } else {
-          record.lastUsedAt = new Date().toISOString()
+        const sessionDir = ctx.sessionManager.getSessionDir()
+        const existing = await SessionManager.list(ctx.cwd, sessionDir)
+        namedSession = {
+          id,
+          name: namedSessionLabel(agent.name, handle),
+          created: !existing.some((candidate) => candidate.id === id),
         }
-        if (record.workspace === "worktree") {
-          if (!record.worktree || !fs.existsSync(record.worktree)) throw new Error(`Persistent worktree is missing: ${record.worktree ?? "(unknown)"}`)
-          cwd = record.worktree
-          worktree = record.worktree
-          branch = record.branch
-        } else {
-          cwd = record.cwd
+        if (agent.worktree) {
+          const root = gitRoot(ctx.cwd)
+          if (!root) throw new Error("Agent requires a git worktree, but cwd is not a git repository")
+          const persistentWorktree = path.join(root, CONFIG_DIR_NAME, "worktrees", `subagent-${id}`)
+          if (!fs.existsSync(persistentWorktree)) {
+            if (!namedSession.created) throw new Error(`Persistent worktree is missing: ${persistentWorktree}`)
+            const created = createWorktree(ctx.cwd, id)
+            cwd = created.worktree
+            worktree = created.worktree
+            branch = created.branch
+          } else {
+            cwd = persistentWorktree
+            worktree = persistentWorktree
+            branch = `pi-subagent/${id}`
+          }
         }
-        writeState(records)
       } catch (error) {
-        runningPersistentSessions.delete(key)
+        runningPersistentSessions.delete(id)
         throw error
       }
     } else if (agent.worktree) {
@@ -556,13 +560,17 @@ export default function (pi: ExtensionAPI) {
       branch = created.branch
     }
 
-    const prompt = temporaryPrompt(agent, task.session && record && isNewPersistentSession ? initialContext : task.session ? "empty" : initialContext, ctx)
+    const prompt = temporaryPrompt(agent, namedSession?.created ? initialContext : task.session ? "empty" : initialContext, ctx)
     try {
       const args = ["--mode", "json", "-p", ...resolveCliOptions(agent, task, ctx)]
       if (task.model ?? agent.model) args.push("--model", task.model ?? agent.model!)
       if (agent.thinking) args.push("--thinking", agent.thinking)
-      if (task.session && record) args.push("--session", record.sessionFile)
-      else args.push("--no-session")
+      if (namedSession) {
+        args.push("--session-dir", ctx.sessionManager.getSessionDir(), "--session-id", namedSession.id)
+        if (namedSession.created) args.push("--name", namedSession.name)
+      } else {
+        args.push("--no-session")
+      }
       if (prompt.file) args.push("--append-system-prompt", prompt.file)
       args.push(`Task: ${task.task}`)
       const result = await runChild(args, cwd, signal, onUpdate)
@@ -609,6 +617,39 @@ export default function (pi: ExtensionAPI) {
     return { output: previous || "(no output)", failed: false, results }
   }
 
+  const describeSubagents = async (ctx: ExtensionContext): Promise<string> => {
+    const agents = discoverAgents(ctx)
+    let sessions: SessionPanelItem[] = []
+    let sessionError: string | undefined
+    try {
+      sessions = await listPersistentSessions(ctx)
+    } catch (error) {
+      sessionError = error instanceof Error ? error.message : String(error)
+    }
+    const agentLines = agents.length > 0
+      ? agents.map((agent) => `- ${agent.name}: ${agent.description}${agent.worktree ? " (isolated worktree)" : ""}`).join("\n")
+      : "- (none discovered)"
+    const sessionLines = sessionError
+      ? `- unavailable: ${sessionError}`
+      : sessions
+          .map((session) => `- ${session.agent}/${session.handle} (${session.session.messageCount} messages; last used ${session.session.modified.toISOString()})`)
+          .join("\n") || "- (none)"
+
+    return [
+      "## Delegation",
+      "Delegate only when independent work improves speed or quality. Keep final judgment, scope approval, integration, and user communication.",
+      "Every delegation prompt states:\n1. Goal and acceptance criteria.\n2. Bounded scope, ownership, and forbidden areas.\n3. Required output format.\n4. Validation expected.",
+      "Do not send concurrent agents to edit same files without explicit worktree and merge ownership. Review returned evidence against acceptance criteria; do not relay it blindly. Stop or narrow work that starts looping, duplicating, or exceeding value.",
+      "\n## Available subagents",
+      agentLines,
+      "\nPersistent sessions for this project:\n" + sessionLines,
+    ].join("\n\n")
+  }
+
+  pi.on("before_agent_start", async (event, ctx) => ({
+    systemPrompt: `${event.systemPrompt}\n\n${await describeSubagents(ctx)}`,
+  }))
+
   pi.on("session_start", (_event, ctx) => {
     latestContext = ctx
     hostAcceptsCallbacks = true
@@ -622,7 +663,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate specialized work. Supports single, parallel, and chain modes; persistent Pi sessions; optional parent-context snapshots; foreground or background completion callbacks.",
+    description: "Delegate a task to a specialized subagent.",
     parameters: SubagentParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       latestContext = ctx
@@ -670,24 +711,45 @@ export default function (pi: ExtensionAPI) {
   })
 
   pi.registerCommand("subagent", {
-    description: "List persistent subagent sessions and active runs",
+    description: "Inspect persistent subagent sessions and active runs",
     handler: async (_args, ctx) => {
       latestContext = ctx
-      const sessions = readState().filter((record) => record.cwd === ctx.cwd)
-      const running = [...activeRuns.values()].map((run) => `● ${run.label} · ${run.background ? "background" : "foreground"} · running`)
-      const persistent = sessions.map((record) => {
-        const status = runningPersistentSessions.has(record.key) ? "running" : "idle"
-        const workspace = record.workspace === "worktree" ? record.worktree ?? "missing worktree" : "shared cwd"
-        return `${status === "running" ? "●" : "○"} ${record.agent}/${record.session} · ${status} · ${workspace}`
-      })
-      const lines = [
-        "Running",
-        ...(running.length ? running : ["  (none)"]),
-        "──────────────",
-        "Persistent sessions",
-        ...(persistent.length ? persistent : ["  (none)"]),
+      const sessions = await listPersistentSessions(ctx)
+      for (const session of sessions) session.active = runningPersistentSessions.has(session.session.id)
+      const running = [...activeRuns.values()]
+      const title = running.length > 0
+        ? `Subagent sessions (${running.length} active run${running.length === 1 ? "" : "s"})`
+        : "Subagent sessions"
+
+      if (sessions.length === 0) {
+        if (ctx.hasUI) await ctx.ui.select(title, ["No persistent subagent sessions in this project."])
+        return
+      }
+
+      const labels = new Map<string, SessionPanelItem>()
+      for (const item of sessions) {
+        const state = item.active ? "running" : "idle"
+        const label = `${item.active ? "●" : "○"} ${item.agent}/${item.handle} · ${state} · ${item.session.messageCount} messages · ${formatAge(item.session.modified)}`
+        labels.set(label, item)
+      }
+      if (!ctx.hasUI) return
+      const selected = await ctx.ui.select(title, [...labels.keys()])
+      const item = selected ? labels.get(selected) : undefined
+      if (!item) return
+
+      const worktree = worktreeDetails(ctx.cwd, item.session.id)
+      const details = [
+        `${item.agent}/${item.handle}`,
+        `State: ${item.active ? "running" : "idle"}`,
+        `Messages: ${item.session.messageCount}`,
+        `Created: ${item.session.created.toISOString()}`,
+        `Last active: ${item.session.modified.toISOString()} (${formatAge(item.session.modified)})`,
+        `Session ID: ${item.session.id}`,
+        `First task: ${oneLine(item.session.firstMessage)}`,
+        `Worktree: ${worktree ? worktree.path : "shared cwd"}`,
+        ...(worktree ? [`Branch: ${worktree.branch}`, `Changes: ${worktree.changes}`] : []),
       ]
-      if (ctx.hasUI) await ctx.ui.select("Subagents", lines)
+      await ctx.ui.select("Subagent details", details)
     },
   })
 }
