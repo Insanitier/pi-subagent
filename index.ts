@@ -611,11 +611,7 @@ export default function (pi: ExtensionAPI) {
           .join("\n") || "- (none)"
 
     return [
-      "## Delegation",
-      "Delegate only when independent work improves speed or quality. Keep final judgment, scope approval, integration, and user communication.",
-      "Every delegation prompt states:\n1. Goal and acceptance criteria.\n2. Bounded scope, ownership, and forbidden areas.\n3. Required output format.\n4. Validation expected.",
-      "Do not send concurrent agents to edit same files without explicit worktree and merge ownership. Review returned evidence against acceptance criteria; do not relay it blindly. Stop or narrow work that starts looping, duplicating, or exceeding value.",
-      "\n## Available subagents",
+      "## Available subagents",
       agentLines,
       "\nPersistent sessions for this project:\n" + sessionLines,
     ].join("\n\n")
@@ -638,7 +634,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate a task to a specialized subagent.",
+    description: "Launch a specialized subagent for complex, multi-step work.\n\nWhen to use: task matches an available agent type, independent work can run in parallel, or answering requires inspecting several files. For a single-fact lookup where you already know file, symbol, or value, inspect it directly. Once you delegate an investigation, do not repeat that same investigation yourself; wait for its result.\n\nAvailable agents are listed in system context. Each agent's model, tools, skills, persistence, and worktree behavior come from its Markdown profile.\n\nUse exactly one mode: agent + task for one task, tasks for parallel tasks, or chain for sequential tasks; {previous} in a chain task is replaced with prior output. initialContext defaults to \"empty\"; use \"parent\" only to pass a one-time snapshot of parent active-branch context. session creates or resumes a named persistent session only for an agent configured as persistent. background runs one agent + task asynchronously and returns its result in a follow-up message.\n\nDo NOT fabricate or predict a pending agent's result. The result is evidence for you to assess, not a user-facing response by itself.",
     parameters: SubagentParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       latestContext = ctx
