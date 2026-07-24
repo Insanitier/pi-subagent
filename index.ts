@@ -432,6 +432,20 @@ function assertValidRequest(params: Record<string, unknown>): void {
   }
 }
 
+function workflowRunLabel(params: Record<string, unknown>): string {
+  const mode = nonEmptyTaskList(params.tasks) ? "parallel" : nonEmptyTaskList(params.chain) ? "sequential" : undefined
+  if (!mode) return String(params.agent)
+
+  const entries = (mode === "parallel" ? params.tasks : params.chain) as unknown[]
+  const agents = entries
+    .map((entry) => typeof entry === "object" && entry !== null ? (entry as { agent?: unknown }).agent : undefined)
+    .filter((agent): agent is string => typeof agent === "string")
+  const counts = new Map<string, number>()
+  for (const agent of agents) counts.set(agent, (counts.get(agent) ?? 0) + 1)
+  const profiles = [...counts].map(([agent, count]) => count === 1 ? agent : `${agent} × ${count}`).join(", ")
+  return `${entries.length} ${mode} task${entries.length === 1 ? "" : "s"}${profiles ? ` · ${profiles}` : ""}`
+}
+
 function assertSubagentSelfCheck(): void {
   if (namedSessionId("/tmp/project", "research", "paper-a") === namedSessionId("/tmp/project", "research", "paper-b")) {
     throw new Error("Named session IDs must be distinct")
@@ -639,7 +653,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       latestContext = ctx
       const background = params.background === true
-      const label = String(params.agent)
+      const label = workflowRunLabel(params as Record<string, unknown>)
       const run = startRun(label, background)
       const update = background ? undefined : (output: string) => onUpdate?.({ content: [{ type: "text", text: output }], details: {} })
       const work = runWorkflow(params as Record<string, unknown>, ctx, background ? undefined : signal, update)
