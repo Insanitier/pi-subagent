@@ -38,10 +38,6 @@ type Agent = {
 type Task = {
   agent: string
   task: string
-  model?: string
-  tools?: string
-  toolsBlacklist?: string
-  skills?: string
   session?: string
   initialContext?: string
 }
@@ -91,10 +87,6 @@ const runningPersistentSessions = new Set<string>()
 const TaskSchema = Type.Object({
   agent: Type.String({ description: "Name of the agent to invoke" }),
   task: Type.String({ description: "Task to delegate" }),
-  model: Type.Optional(Type.String({ description: "Model override" })),
-  tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
-  toolsBlacklist: Type.Optional(Type.String({ description: "Comma-separated tool denylist" })),
-  skills: Type.Optional(Type.String({ description: "Comma-separated skill allowlist" })),
   session: Type.Optional(Type.String({ description: "Persistent session name (only for agents configured as persistent)" })),
   initialContext: Type.Optional(Type.String({ description: '"empty" (default) or "parent"' })),
 })
@@ -102,10 +94,6 @@ const TaskSchema = Type.Object({
 const SubagentParams = Type.Object({
   agent: Type.Optional(Type.String({ description: "Agent name for a single task" })),
   task: Type.Optional(Type.String({ description: "Task for a single agent" })),
-  model: Type.Optional(Type.String({ description: "Model override" })),
-  tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
-  toolsBlacklist: Type.Optional(Type.String({ description: "Comma-separated tool denylist" })),
-  skills: Type.Optional(Type.String({ description: "Comma-separated skill allowlist" })),
   session: Type.Optional(Type.String({ description: "Persistent session name (only for agents configured as persistent)" })),
   initialContext: Type.Optional(Type.String({ description: '"empty" (default) or "parent"' })),
   background: Type.Optional(Type.Boolean({ description: "Run without blocking; completion is sent back to parent session" })),
@@ -241,42 +229,19 @@ function resolveSkillPaths(ctx: ExtensionContext, names: string[] | undefined): 
   })
 }
 
-function requestedList(value: string | undefined, label: string): string[] | undefined {
-  if (value === undefined) return undefined
-  const list = splitList(value)
-  if (!list) throw new Error(`${label} cannot be empty`)
-  return list
-}
 
-function resolveCliOptions(agent: Agent, task: Task, ctx: ExtensionContext): string[] {
-  const requestedTools = requestedList(task.tools, "tools")
-  const requestedBlacklist = requestedList(task.toolsBlacklist, "toolsBlacklist")
-  if (requestedTools && requestedBlacklist) throw new Error("tools and toolsBlacklist are mutually exclusive")
 
-  let allowed = agent.tools ? new Set(agent.tools) : undefined
+function resolveCliOptions(agent: Agent, ctx: ExtensionContext): string[] {
+  const allowed = agent.tools ? new Set(agent.tools) : undefined
   const denied = new Set(agent.toolsBlacklist ?? [])
   denied.add("subagent") // no recursive subagent calls
 
-  if (requestedTools) {
-    const request = new Set(requestedTools)
-    allowed = allowed ? new Set([...allowed].filter((tool) => request.has(tool))) : request
-  }
-  for (const tool of requestedBlacklist ?? []) denied.add(tool)
   if (allowed) {
     for (const tool of denied) allowed.delete(tool)
     if (allowed.size === 0) throw new Error(`No tools remain after applying ${agent.name}'s tool policy`)
   }
 
-  const requestedSkills = requestedList(task.skills, "skills")
   const skills = agent.skills
-    ? requestedSkills
-      ? agent.skills.filter((skill) => requestedSkills.includes(skill))
-      : agent.skills
-    : requestedSkills
-
-  if (agent.skills && requestedSkills && skills.length === 0) {
-    throw new Error(`No skills remain after applying ${agent.name}'s skill policy`)
-  }
 
   const args = ["--no-skills"]
   for (const skillPath of resolveSkillPaths(ctx, skills)) args.push("--skill", skillPath)
@@ -443,10 +408,6 @@ function taskFromTopLevel(params: Record<string, unknown>): Task {
   return {
     agent: params.agent as string,
     task: params.task as string,
-    model: optionalString(params.model),
-    tools: optionalString(params.tools),
-    toolsBlacklist: optionalString(params.toolsBlacklist),
-    skills: optionalString(params.skills),
     session: optionalString(params.session),
     initialContext: optionalString(params.initialContext),
   }
@@ -466,8 +427,8 @@ function assertValidRequest(params: Record<string, unknown>): void {
   if (params.background === true && !params.agent) {
     throw new Error("background is only supported for a single agent + task")
   }
-  if ((nonEmptyTaskList(params.tasks) || nonEmptyTaskList(params.chain)) && (optionalString(params.session) || optionalString(params.initialContext) || optionalString(params.model) || optionalString(params.tools) || optionalString(params.toolsBlacklist) || optionalString(params.skills))) {
-    throw new Error("Put session, initialContext, model, tools, and skills on each parallel or chain task")
+  if ((nonEmptyTaskList(params.tasks) || nonEmptyTaskList(params.chain)) && (optionalString(params.session) || optionalString(params.initialContext))) {
+    throw new Error("Put session and initialContext on each parallel or chain task")
   }
 }
 
@@ -568,8 +529,8 @@ export default function (pi: ExtensionAPI) {
     let child: Omit<RunResult, "agent" | "worktree" | "branch"> | undefined
     let savedBranch: string | undefined
     try {
-      const args = ["--mode", "json", "-p", ...resolveCliOptions(agent, task, ctx)]
-      if (task.model ?? agent.model) args.push("--model", task.model ?? agent.model!)
+      const args = ["--mode", "json", "-p", ...resolveCliOptions(agent, ctx)]
+      if (agent.model) args.push("--model", agent.model)
       if (agent.thinking) args.push("--thinking", agent.thinking)
       if (namedSession) {
         args.push("--session-dir", ctx.sessionManager.getSessionDir(), "--session-id", namedSession.id)
